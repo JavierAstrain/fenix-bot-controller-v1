@@ -1,3 +1,4 @@
+
 import pandas as pd
 
 def _describe_safe(df: pd.DataFrame):
