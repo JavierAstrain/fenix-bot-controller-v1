@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6,7 +5,7 @@ import gspread
 import json
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
-from analizador import analizar_datos_taller
+from io import BytesIO
 
 st.set_page_config(layout="wide", page_title="Controller Financiero IA")
 
@@ -29,20 +28,11 @@ if not st.session_state.authenticated:
     login()
     st.stop()
 
-# --- MEMORIA DE CONVERSACIÓN ---
-if "historial" not in st.session_state:
-    st.session_state.historial = []
-if "data" not in st.session_state:
-    st.session_state.data = None
-if "sheet_url" not in st.session_state:
-    st.session_state.sheet_url = ""
+# --- FUNCIONES ---
 
-# --- CARGA DE DATOS CON CACHE ---
-@st.cache_data(show_spinner=False)
 def load_excel(file):
     return pd.read_excel(file, sheet_name=None)
 
-@st.cache_data(show_spinner=False)
 def load_gsheet(json_keyfile, sheet_url):
     creds_dict = json.loads(json_keyfile)
     scope = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -53,14 +43,9 @@ def load_gsheet(json_keyfile, sheet_url):
 
 def ask_gpt(prompt):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    messages = [{"role": "system", "content": "Eres un controller financiero experto de un taller de desabolladura y pintura."}]
-    for h in st.session_state.historial:
-        messages.append({"role": "user", "content": h["pregunta"]})
-        messages.append({"role": "assistant", "content": h["respuesta"]})
-    messages.append({"role": "user", "content": prompt})
     response = client.chat.completions.create(
         model="gpt-4o",
-        messages=messages,
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
     return response.choices[0].message.content
@@ -87,24 +72,19 @@ def mostrar_tabla(df, col_categoria, col_valor):
 
 # --- INTERFAZ EN COLUMNAS ---
 col1, col2, col3 = st.columns([1, 2, 1])
+data = None
 
 with col1:
     st.markdown("### 📁 Subir archivo")
-    tipo_fuente = st.radio("Fuente de datos", ["Excel", "Google Sheets"], key="k_fuente")
-
+    tipo_fuente = st.radio("Fuente de datos", ["Excel", "Google Sheets"])
     if tipo_fuente == "Excel":
-        file = st.file_uploader("Sube un archivo Excel", type=["xlsx", "xls"], key="k_excel")
+        file = st.file_uploader("Sube un archivo Excel", type=["xlsx", "xls"])
         if file:
-            st.session_state.data = load_excel(file)
+            data = load_excel(file)
     else:
-        with st.form(key="form_gsheet"):
-            url = st.text_input("URL de Google Sheet", value=st.session_state.sheet_url, key="k_url")
-            conectar = st.form_submit_button("Conectar")
-        if conectar and url:
-            st.session_state.sheet_url = url
-            st.session_state.data = load_gsheet(st.secrets["GOOGLE_CREDENTIALS"], url)
-
-data = st.session_state.data
+        url = st.text_input("URL de Google Sheet")
+        if url and st.button("Conectar"):
+            data = load_gsheet(st.secrets["GOOGLE_CREDENTIALS"], url)
 
 with col2:
     if data:
@@ -117,84 +97,42 @@ with col3:
     if data:
         st.markdown("### 🤖 Consulta con IA")
         pregunta = st.text_area("Pregunta")
-
-        if st.button("📊 Análisis General Automático"):
-            analisis = analizar_datos_taller(st.session_state.data)
-            texto_analisis = json.dumps(analisis, indent=2, ensure_ascii=False)
-            prompt = f"""
-Eres un controller financiero senior.
-
-Con base en los datos calculados (reales) a continuación, entrega un análisis profesional, directo y accionable.
-Si una visualización ayuda a entender mejor, incluye UNA instrucción exacta:
-- grafico_torta:col_categoria|col_valor|titulo
-- grafico_barras:col_categoria|col_valor|titulo
-- tabla:col_categoria|col_valor
-
-No inventes datos. Si falta información, dilo y propone cómo completarla.
-
-Datos calculados:
-{texto_analisis}
-"""
-            respuesta = ask_gpt(prompt)
-            st.markdown(respuesta)
-            st.session_state.historial.append({"pregunta": "Análisis general", "respuesta": respuesta})
-
         if st.button("Responder") and pregunta:
-            analisis = analizar_datos_taller(st.session_state.data)
-            texto_analisis = json.dumps(analisis, indent=2, ensure_ascii=False)
-            prompt = f"""
-Actúa estrictamente como un controller financiero senior de un taller de desabolladura y pintura.
+            contenido = ""
+            for name, df in data.items():
+                contenido += f"Hoja: {name}\n{df.head(50).to_string(index=False)}\n\n"
 
-Usa EXCLUSIVAMENTE los siguientes datos calculados (reales) para responder, sin inventar:
-{texto_analisis}
+            prompt = (
+                "Eres un controller financiero experto. Analiza los siguientes datos de un taller "
+                "de desabolladura y pintura de vehículos livianos y pesados:\n\n"
+                f"{contenido}\n"
+                f"Pregunta: {pregunta}\n\n"
+                "Responde con análisis detallado y genera instrucciones de visualización si es útil.\n"
+                "Si deseas un gráfico, usa el formato: grafico_torta:columna_categoria|columna_valor|titulo\n"
+                "Para gráfico de barras usa: grafico_barras:columna_categoria|columna_valor|titulo\n"
+                "Para una tabla usa: tabla:columna_categoria|columna_valor"
+            )
 
-Debes:
-- Responder a la pregunta con análisis profesional, directo y conciso.
-- Si el usuario pide o amerita una visualización y las columnas existen, incluye UNA instrucción exacta:
-  - grafico_torta:col_categoria|col_valor|titulo
-  - grafico_barras:col_categoria|col_valor|titulo
-  - tabla:col_categoria|col_valor
-- Entregar 1-3 recomendaciones accionables para la gerencia.
-- Si falta información para responder con precisión, dilo y sugiere cómo completarla.
-
-Pregunta del usuario:
-{pregunta}
-"""
             respuesta = ask_gpt(prompt)
             st.markdown(respuesta)
-            st.session_state.historial.append({"pregunta": pregunta, "respuesta": respuesta})
 
-            def safe_plot(plot_fn, hoja, df, col_cat, col_val, titulo):
-                col_cat = col_cat.strip()
-                col_val = col_val.strip()
-                if col_cat not in df.columns or col_val not in df.columns:
-                    st.warning(f"❗ No se pudo generar el gráfico en '{hoja}'. Revisar columnas: '{col_cat}' y '{col_val}'.")
-                    return
-                try:
-                    plot_fn(df, col_cat, col_val, titulo)
-                except Exception as e:
-                    st.error(f"Error generando gráfico en '{hoja}': {e}")
-
+            # Procesar visualizaciones
             for linea in respuesta.splitlines():
                 if "grafico_torta:" in linea:
                     partes = linea.replace("grafico_torta:", "").split("|")
                     if len(partes) == 3:
-                        for hoja, df in st.session_state.data.items():
-                            safe_plot(mostrar_grafico_torta, hoja, df, partes[0], partes[1], partes[2])
+                        for hoja, df in data.items():
+                            if partes[0].strip() in df.columns and partes[1].strip() in df.columns:
+                                mostrar_grafico_torta(df, partes[0].strip(), partes[1].strip(), partes[2].strip())
                 if "grafico_barras:" in linea:
                     partes = linea.replace("grafico_barras:", "").split("|")
                     if len(partes) == 3:
-                        for hoja, df in st.session_state.data.items():
-                            safe_plot(mostrar_grafico_barras, hoja, df, partes[0], partes[1], partes[2])
+                        for hoja, df in data.items():
+                            if partes[0].strip() in df.columns and partes[1].strip() in df.columns:
+                                mostrar_grafico_barras(df, partes[0].strip(), partes[1].strip(), partes[2].strip())
                 if "tabla:" in linea:
                     partes = linea.replace("tabla:", "").split("|")
                     if len(partes) == 2:
-                        for hoja, df in st.session_state.data.items():
+                        for hoja, df in data.items():
                             if partes[0].strip() in df.columns and partes[1].strip() in df.columns:
                                 mostrar_tabla(df, partes[0].strip(), partes[1].strip())
-
-    if st.session_state.historial:
-        with st.expander("🧠 Historial de la sesión"):
-            for i, h in enumerate(st.session_state.historial[-10:], 1):
-                st.markdown(f"**Q{i}:** {h['pregunta']}")
-                st.markdown(f"**A{i}:** {h['respuesta']}")
