@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -62,6 +63,7 @@ def load_gsheet(json_keyfile: str, sheet_url: str):
 def ask_gpt(prompt):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     messages = [{"role": "system", "content": "Eres un controller financiero experto de un taller de desabolladura y pintura."}]
+    # contexto conversacional corto y útil
     for h in st.session_state.historial[-8:]:
         messages.append({"role": "user", "content": h["pregunta"]})
         messages.append({"role": "assistant", "content": h["respuesta"]})
@@ -123,93 +125,89 @@ def mostrar_tabla(df, col_categoria, col_valor, titulo=None):
     st.markdown(f"### 📊 {titulo if titulo else f'{col_val} por {col_categoria}'}")
     st.dataframe(resumen, use_container_width=True)
 
-# --- NORMALIZACIÓN & PARSER DE INSTRUCCIONES ---
+# --- NORMALIZACIÓN Y BÚSQUEDA ROBUSTA DE COLUMNAS ---
 def _normalize(s: str) -> str:
-    s = str(s).strip()
+    # NBSP -> espacio; quita acentos; colapsa espacios; minúsculas
+    s = str(s).replace("\u00A0", " ").strip()
     s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    s = re.sub(r'\s+', ' ', s)
     s = s.lower()
-    s = re.sub(r'[^a-z0-9]+', '_', s).strip('_')
     return s
 
-def _build_aliases_for_sheets(data_dict: dict):
-    aliases = {}
-    for hoja, df in data_dict.items():
-        m = {}
-        for c in df.columns:
-            m[_normalize(c)] = c
-        aliases[hoja] = m
-    return aliases
-
-def _resolve_column(name: str, hoja: str, aliases_by_sheet: dict):
-    n = _normalize(name)
-    if hoja in aliases_by_sheet and n in aliases_by_sheet[hoja]:
-        return aliases_by_sheet[hoja][n]
-    for m in aliases_by_sheet.values():
-        if n in m:
-            return m[n]
+def find_col(df, name: str):
+    tgt = _normalize(name)
+    for c in df.columns:
+        if _normalize(c) == tgt:
+            return c
     return None
 
+# --- PARSER DE INSTRUCCIONES ---
 def parse_and_render_instructions(respuesta_texto: str, data_dict: dict):
-    """Detecta instrucciones aunque vengan con viñetas/codeblocks. Soporta @HOJA opcional.
-    Formatos:
-      - grafico_torta[:|@HOJA:]categoria|valor|titulo
-      - grafico_barras[:|@HOJA:]categoria|valor|titulo
-      - tabla[:|@HOJA:]categoria|valor[|titulo]
     """
-    aliases = _build_aliases_for_sheets(data_dict)
+    Soporta viñetas, code blocks y opcional @HOJA.
+    Formatos:
+      - grafico_torta[:|@HOJA:]cat|val|titulo
+      - grafico_barras[:|@HOJA:]cat|val|titulo
+      - tabla[:|@HOJA:]cat|val[|titulo]
+    """
+    patt = re.compile(r'(grafico_torta|grafico_barras|tabla)(?:@([^\s:]+))?\s*:\s*([^\n\r]+)', re.IGNORECASE)
 
-    def safe_plot(plot_fn, hoja, df, col_cat, col_val, titulo):
-        real_cat = _resolve_column(col_cat, hoja, aliases)
-        real_val = _resolve_column(col_val, hoja, aliases)
-        if not real_cat or not real_val or real_cat not in df.columns or real_val not in df.columns:
-            st.warning(f"❗ No se pudo generar la visualización. Revisar columnas: '{col_cat}' y '{col_val}'.")
+    def safe_plot(plot_fn, hoja, df, cat_raw, val_raw, titulo):
+        cat = find_col(df, cat_raw)
+        val = find_col(df, val_raw)
+        if not cat or not val:
+            st.warning(f"❗ No se pudo generar la visualización en '{hoja}'. Revisar columnas: '{cat_raw}' y '{val_raw}'.")
             return
         try:
-            plot_fn(df, real_cat, real_val, titulo if titulo else f"{real_val} por {real_cat}")
+            plot_fn(df, cat, val, titulo)
         except Exception as e:
-            st.error(f"Error generando visualización: {e}")
+            st.error(f"Error generando visualización en '{hoja}': {e}")
 
-    patt = re.compile(r'(grafico_torta|grafico_barras|tabla)(?:@([^:\n\r\s]+))?\s*:\s*([^\n\r]+)', re.IGNORECASE)
     for m in patt.finditer(respuesta_texto):
         kind = m.group(1).lower()
         hoja_sel = m.group(2)
         body = m.group(3).strip().strip("`").lstrip("-*• ").strip()
-
         parts = [p.strip(" `*-•").strip() for p in body.split("|")]
+
         if kind in ("grafico_torta", "grafico_barras"):
             if len(parts) != 3:
                 st.warning("Instrucción de gráfico inválida.")
                 continue
-            cat, val, title = parts
+            cat_raw, val_raw, title = parts
             if hoja_sel and hoja_sel in data_dict:
-                safe_plot(mostrar_grafico_torta if kind == "grafico_torta" else mostrar_grafico_barras,
-                          hoja_sel, data_dict[hoja_sel], cat, val, title)
+                if find_col(data_dict[hoja_sel], cat_raw) and find_col(data_dict[hoja_sel], val_raw):
+                    safe_plot(mostrar_grafico_torta if kind=="grafico_torta" else mostrar_grafico_barras,
+                              hoja_sel, data_dict[hoja_sel], cat_raw, val_raw, title)
+                else:
+                    st.warning(f"No se encontraron columnas en la hoja '{hoja_sel}' para: {cat_raw} | {val_raw}")
             else:
-                ok = False
+                dibujado = False
                 for hoja, df in data_dict.items():
-                    safe_plot(mostrar_grafico_torta if kind == "grafico_torta" else mostrar_grafico_barras,
-                              hoja, df, cat, val, title)
-                    ok = True
-                if not ok:
-                    st.warning("No se pudo generar el gráfico en ninguna hoja.")
+                    if find_col(df, cat_raw) and find_col(df, val_raw):
+                        safe_plot(mostrar_grafico_torta if kind=="grafico_torta" else mostrar_grafico_barras,
+                                  hoja, df, cat_raw, val_raw, title)
+                        dibujado = True
+                if not dibujado:
+                    st.warning("No se pudo generar el gráfico en ninguna hoja (verifica nombres de columnas).")
+
         else:  # tabla
             if len(parts) not in (2, 3):
                 st.warning("Instrucción de tabla inválida.")
                 continue
-            cat, val = parts[0], parts[1]
+            cat_raw, val_raw = parts[0], parts[1]
             title = parts[2] if len(parts) == 3 else None
 
             def draw_table_on(df, hoja):
-                real_cat = _resolve_column(cat, hoja, aliases)
-                real_val = _resolve_column(val, hoja, aliases)
-                if real_cat and real_val and real_cat in df.columns and real_val in df.columns:
-                    mostrar_tabla(df, real_cat, real_val, titulo=title or f"Tabla: {real_val} por {real_cat} ({hoja})")
+                cat = find_col(df, cat_raw)
+                val = find_col(df, val_raw)
+                if cat and val:
+                    mostrar_tabla(df, cat, val, titulo=title or f"Tabla: {val} por {cat} ({hoja})")
                     return True
                 return False
 
             if hoja_sel and hoja_sel in data_dict:
                 if not draw_table_on(data_dict[hoja_sel], hoja_sel):
-                    st.warning(f"No se pudo generar la tabla en '{hoja_sel}'.")
+                    st.warning(f"No se pudo generar la tabla en '{hoja_sel}'. Revisar columnas: '{cat_raw}' y '{val_raw}'.")
             else:
                 ok = False
                 for hoja, df in data_dict.items():
